@@ -1,9 +1,10 @@
 version: "3"
-
 networks:
  kong-net:
   driver: bridge
-
+  ipam:
+    config:
+      - subnet: 172.19.0.0/16
 services:
 
   #######################################
@@ -13,7 +14,8 @@ services:
     image: postgres:9.6
     restart: always
     networks:
-      - kong-net
+      kong-net:
+        ipv4_address: 172.19.0.2
     environment:
       POSTGRES_USER: kong
       POSTGRES_DB: kong
@@ -25,21 +27,24 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
-
+    volumes:
+      - /home/mulki/storage/kong_data:/var/lib/postgresql/data
   #######################################
   # Kong database migration
   #######################################
   kong-migration:
-    image: kong:1.5
+    image: kong:2.2
     command: "kong migrations bootstrap"
     networks:
-      - kong-net
+      kong-net:
+        ipv4_address: 172.19.0.3
     restart: on-failure
     environment:
       KONG_PG_HOST: kong-database
       KONG_PG_PASSWORD: kong
+      KONG_PG_USER: kong
     links:
-      - kong-database
+      - kong-database:kong-database
     depends_on:
       - kong-database
 
@@ -47,23 +52,297 @@ services:
   # Kong: The API Gateway
   #######################################
   kong:
-    image: kong:1.5
+    image: kong:2.2
     restart: always
     networks:
-      - kong-net
+      kong-net:
+        ipv4_address: 172.19.0.4
     environment:
-      KONG_PG_HOST: kong-database
+      KONG_DATABASE: postgres
+      KONG_PG_HOST: 172.19.0.2
+      KONG_PG_USER: kong
       KONG_PG_PASSWORD: kong
       KONG_PROXY_LISTEN: 0.0.0.0:8000
       KONG_PROXY_LISTEN_SSL: 0.0.0.0:8443
-      KONG_ADMIN_LISTEN: 0.0.0.0:8001
+      KONG_ADMIN_LISTEN: 0.0.0.0:8001, 0.0.0.0:8444 ssl
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
     depends_on:
       - kong-database
+    links:
+      - kong-database:kong-database
     healthcheck:
       test: ["CMD", "curl", "-f", "http://kong:8001"]
       interval: 5s
       timeout: 2s
       retries: 15
     ports:
-      - 8001:8001
-      - 8000:8000
+      - "8001:8001"
+      - "8000:8000"
+      - "8443:8443"
+      - "8444:8444"
+    volumes:
+      - /home/mulki/storage/kong_prefix_vol:/var/run/kong
+
+  #######################################
+  # Konga
+  #######################################
+  konga:
+    image: pantsel/konga
+    depends_on:
+      - kong
+    networks:
+      kong-net:
+        ipv4_address: 172.19.0.5
+    ports:
+      - "1337:1337"
+    environment:
+      DB_ADAPTER: postgres
+      DB_HOST: 172.19.0.2
+      DB_PORT: '5432'
+      DB_USER: kong
+      DB_PASSWORD: kong
+      DB_DATABASE: kong
+      NODE_ENV: development
+    stdin_open: true
+    links:
+      - kong:kong
+    volumes:
+      - /home/mulki/storage/konga_data:/var/lib/konga
+
+  #######################################
+  # Mariadb: database API
+  #######################################
+  mariadb:
+    image: mariadb:10.4
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: 'yes'
+      MYSQL_DATABASE: anjasmara_service_general, anjasmara_service_users, walletservice, ppobs
+      MYSQL_ROOT_PASSWORD: anjas123
+      MYSQL_USER: root
+      MYSQL_PASSWORD: anjas123
+    ports:
+      - 3306:3306
+    depends_on:
+      - kong
+    networks:
+      kong-net:
+        ipv4_address: 172.19.0.6
+    volumes:
+      - /home/mulki/mariadb/dirdata:/var/lib/mysql
+
+  #######################################
+  # Phpmyadmin: Database API
+  #######################################
+  phpmyadmin:
+    image: phpmyadmin
+    restart: always
+    depends_on:
+      - mariadb
+    networks:
+      kong-net:
+        ipv4_address: 172.19.0.7
+    links:
+      - mariadb:mariadb
+    ports:
+      - "8888:80"
+    environment:
+      PMA_ARBITRARY: 1
+      PMA_HOST: 172.19.0.6
+      PMA_PORT: 3306
+      MYSQL_USER: root
+      MYSQL_PASSWORD: anjas123
+
+
+  #######################################
+  # Anjasmara_Service_Generals
+  #######################################
+  generals:
+    build: /home/mulki/anjasmara_service_general/
+    depends_on:
+      - kong
+      - mariadb
+      - rabbitmq
+    networks:
+      kong-net:
+        ipv4_address: 172.19.0.8
+    links:
+      - kong:kong
+      - mariadb:mariadb
+      - rabbitmq:rabbitmq
+    ports:
+      - 3001:3001
+    environment:
+      MYSQL_DATABASE: anjasmara_service_general
+      MYSQL_USER: root
+      MYSQL_PASSWORD: anjas123
+      MYSQL_HOST: 172.19.0.6
+      AMQP_URL: amqp://guest:guest@rabbitmq:5672
+#    entrypoint: ['tail', '-f', '/dev/null']
+
+  #######################################
+  # Anjasmara_Service_Users
+  #######################################
+  users:
+    build : /home/mulki/anjasmara_service_users_v1/
+    networks:
+      kong-net:
+        ipv4_address: 172.19.0.9
+    depends_on:
+      - kong
+      - mariadb
+    links:
+      - kong:kong
+      - mariadb:mariadb
+    ports:
+      - 3000:3000
+    environment:
+      MYSQL_DATABASE: anjasmara_service_users
+      MYSQL_USER: root
+      MYSQL_PASSWORD:
+      MYSQL_HOST: 172.19.0.6
+      AMQP_URL: amqp://guest:guest@rabbitmq:5672
+
+  #######################################
+  # Anjasmara_Website
+  #######################################
+  anjasmara-website:
+    build : /home/mulki/anjasmara_website/
+    networks:
+      kong-net:
+        ipv4_address: 172.19.0.10
+    depends_on:
+      - generals
+      - kong
+      - mariadb
+    links:
+      - generals:generals
+      - kong:kong
+      - mariadb:mariadb
+    ports:
+      - 5000:5000
+    environment:
+      MYSQL_USER: root
+      MYSQL_PASSWORD: anjas123
+      MYSQL_HOST: 172.19.0.6
+
+
+  #######################################
+  # Anjasmara_Dashboard_React
+  #######################################
+  anjasmara_dashboard_react:
+    build : /home/mulki/anjasmara_dashboard_react/
+    networks:
+      kong-net:
+        ipv4_address: 172.19.0.11
+    depends_on:
+      - generals
+      - kong
+      - mariadb
+    links:
+      - generals:generals
+      - mariadb:mariadb
+      - kong:kong
+    ports:
+      - 5001:5001
+
+  wallets:
+    build: /home/mulki/anjasmara_service_wallet/
+    depends_on:
+      - kong
+      - mariadb
+      - generals
+    networks:
+      kong-net:
+        ipv4_address: 172.19.0.14
+    links:
+      - kong:kong
+      - mariadb:mariadb
+      - generals:generals
+    ports:
+      - 3002:3002
+    environment:
+      MYSQL_DATABASE: walletservice
+      MYSQL_USER: root
+      MYSQL_PASSWORD: anjas123
+      MYSQL_HOST: mariadb
+      RABBIT_HOSTNAME: rabbitmq
+      AMQP_URL: amqp://guest:guest@rabbitmq:5673
+
+  ppobs:
+    build: /home/mulki/anjasmara_service_ppob/
+    depends_on:
+      - kong
+      - mariadb
+      - generals
+      - wallets
+    networks:
+      kong-net:
+        ipv4_address: 172.19.0.18
+    links:
+      - kong:kong
+      - mariadb:mariadb
+      - generals:generals
+      - wallets:wallets
+    ports:
+      - 3003:3003
+    environment:
+      MYSQL_DATABASE: ppobs
+      MYSQL_USER: root
+      MYSQL_PASSWORD: anjas123
+      MYSQL_HOST: mariadb
+      RABBIT_HOSTNAME: rabbitmq
+      AMQP_URL: amqp://guest:guest@rabbitmq:5674
+
+  rabbitmq:
+    image: rabbitmq:3.8-management-alpine
+    container_name: 'rabbitmq'
+    ports:
+      - 5672:5672
+      - 5673:5673
+      - 15672:15672
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASSWORD: guest
+      RABBITMQ_DEFAULT_VHOST: guest
+#    volumes:
+#      - /home/mulki/rabbitmq/conf:/etc/rabbitmq/
+#      - /home/mulki/rabbitmq:/var/lib/rabbitmq/
+    networks:
+      kong-net:
+        ipv4_address: 172.19.0.17
+
+
+  proxy:
+    build: /home/mulki/proxy
+    restart: always
+    ports:
+      - "80"
+    links:
+#      - generals:generals
+#      - users:users
+      - konga:konga
+#      - kong:kong
+#      - anjasmara-website:anjasmara-website
+#      - anjasmara_dashboard_react:anjasmara_dashboard_react
+    networks:
+      kong-net:
+        ipv4_address: 172.19.0.16
+#    volumes:
+#      - /home/mulki/proxy/nginx.conf:/etc/nginx/nginx.conf
+
+volumes:
+  konga_data:
+  kong_data: {}
+  kong_prefix_vol:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+  kong_tmp_vol:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+
+
